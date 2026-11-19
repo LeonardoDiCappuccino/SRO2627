@@ -59,7 +59,6 @@ DEFAULT_CFG = {
     "tip_offset": [0.0, 0.0, 0.0],   # Spitze im TCP-KS [m] (Pivot-Kalibrierung)
     "pivot": {"poses": [], "rms_mm": None, "manual": False},
     "force_limit_N": 15.0,   # Kraftgrenze beim Absenken (0 = aus)
-    "contact_detect": True,  # UR-eigene Kontakterkennung (tool_contact) beim Absenken
     "grip_h_mm": 4.0,        # Höhe der Fingerspitzen über dem Tisch beim Greifen
     "approach_mm": 30.0,     # ab hier langsam auf Greifhöhe fahren
     "travel_mm": 120.0,      # Transferhöhe der Fingerspitzen über dem Tisch
@@ -303,6 +302,14 @@ def range_preview(lo, hi, w=256, h=56):
     return np.vstack([bar, np.full((4, w, 3), 32, np.uint8), patch])
 
 
+def frame_ok(f):
+    """False für (fast) schwarze oder einfarbige Bilder - z. B. wenn die Kamera kurz aussetzt."""
+    if f is None or f.size == 0:
+        return False
+    small = f[::8, ::8]
+    return float(small.mean()) > 12 and float(small.std()) > 1.5
+
+
 def to_pixmap(bgr):
     bgr = np.ascontiguousarray(bgr)
     h, w = bgr.shape[:2]
@@ -515,7 +522,6 @@ class RobotTask(QThread):
         self.calib = Calib.from_cfg(self.cfg)
         self.stop_ev = threading.Event()
         self.peak_force = 0.0          # max. gefilterte Kraft bei überwachten Bewegungen (zum Einstellen)
-        self._contact_warned = False
 
     def run(self):
         try:
@@ -558,16 +564,14 @@ class RobotTask(QThread):
     def _move(self, kind, target, v=None, a=None, force_limit=None, retreat=None):
         """kind: 'L' = moveL, 'J' = moveJ (Gelenkwinkel), 'JIK' = moveJ zu kartesischer Pose.
         Mit `retreat` ist die Bewegung überwacht (Absenken): Bei Kontakt stoppen, zu `retreat`
-        zurückfahren und mit CollisionStop abbrechen. Überwachung:
-          1. UR-eigene Kontakterkennung (tool_contact) - rechnet Beschleunigung/Dynamik heraus
-          2. optional Kraftgrenze [N] auf die genullte, gefilterte TCP-Kraft, nur bei konstanter
-             Sollgeschwindigkeit (beim Beschleunigen/Bremsen ausgesetzt -> keine Fehlauslösung)"""
+        zurückfahren und mit CollisionStop abbrechen. Überwachung: Kraftgrenze [N] auf die genullte,
+        gefilterte TCP-Kraft, nur bei konstanter Sollgeschwindigkeit (beim Beschleunigen/Bremsen
+        ausgesetzt -> keine Fehlauslösung durch Trägheit)"""
         sp, c, r = self.cfg["speed"], self.c, self.r
         target = [float(x) for x in target]
         if kind != "J":
             self._require_reachable([target], "Ziel")
         guard = retreat is not None
-        use_contact = guard and self.cfg.get("contact_detect", True)
         base = None
         if guard and force_limit:
             try:
@@ -580,81 +584,55 @@ class RobotTask(QThread):
                 samples.append(r.getActualTCPForce()[:3])
                 time.sleep(0.004)
             base = np.mean(samples, axis=0)          # Rest-Offset nach dem Nullen
-        if use_contact:
-            d = np.array(target[:3]) - np.array(r.getActualTCPPose()[:3])
-            n = float(np.linalg.norm(d))
-            direction = [*(d / n), 0.0, 0.0, 0.0] if n > 1e-4 else [0.0] * 6
-            try:
-                use_contact = bool(c.startContactDetection(direction))
-            except Exception:
-                use_contact = False
-            if not use_contact and not self._contact_warned:
-                self._contact_warned = True
-                self.status.emit("UR-Kontakterkennung nicht verfügbar - nur Kraftgrenze aktiv")
-        try:
-            if kind == "L":
-                ok, stop = c.moveL(target, v or sp["v"], a or sp["a"], True), c.stopL
-            elif kind == "J":
-                ok, stop = c.moveJ(target, v or sp["vj"], a or sp["aj"], True), c.stopJ
-            else:
-                ok, stop = c.moveJ_IK(target, v or sp["vj"], a or sp["aj"], True), c.stopJ
-            if not ok:
-                raise MoveRejected("Ziel nicht erreichbar" + ("" if kind == "J" else f": {fmt_pose(target)}"))
-            t0, idle = time.monotonic(), None
-            fwin = []
-            v_prev, t_prev, t_acc = None, None, time.monotonic()
-            while True:
-                self._check(stop)
-                time.sleep(0.004 if guard else 0.01)
-                if use_contact and c.readContactDetection():
-                    self._collision(stop, retreat, use_contact, "Kontakt erkannt (UR-Kontakterkennung)")
-                if base is not None:
-                    now = time.monotonic()
-                    vt = np.array(r.getTargetTCPSpeed()[:3])
-                    if v_prev is None or (now > t_prev and
-                                          float(np.linalg.norm(vt - v_prev)) / (now - t_prev) > 0.05):
-                        t_acc = now                              # Soll beschleunigt/bremst gerade
-                    v_prev, t_prev = vt, now
-                    f = float(np.linalg.norm(np.array(r.getActualTCPForce()[:3]) - base))
-                    if now - t_acc < 0.06:
-                        fwin = []          # Werte aus Beschleunigung/Bremsen verwerfen (Trägheit)
-                        continue_check = False
-                    else:
-                        fwin = (fwin + [f])[-4:]                 # gleitender Mittelwert
-                        continue_check = len(fwin) >= 3
-                    fm = sum(fwin) / len(fwin) if fwin else 0.0
-                    self.peak_force = max(self.peak_force, fm)
-                    if continue_check and fm > force_limit:
-                        self._collision(stop, retreat, use_contact,
-                                        f"Kraftgrenze überschritten ({fm:.1f} N > {force_limit:.0f} N)")
-                if c.getAsyncOperationProgress() >= 0:
-                    idle = None
-                    continue
-                if self._reached(kind, target):
-                    return
-                if time.monotonic() - t0 < 0.3:
-                    continue
-                idle = idle or time.monotonic()
-                if time.monotonic() - idle > 1.5:
-                    raise MoveRejected("Bewegung vorzeitig beendet (Ziel nicht erreicht)")
-        finally:
-            if use_contact:
-                try:
-                    c.stopContactDetection()
-                except Exception:
-                    pass
+        if kind == "L":
+            ok, stop = c.moveL(target, v or sp["v"], a or sp["a"], True), c.stopL
+        elif kind == "J":
+            ok, stop = c.moveJ(target, v or sp["vj"], a or sp["aj"], True), c.stopJ
+        else:
+            ok, stop = c.moveJ_IK(target, v or sp["vj"], a or sp["aj"], True), c.stopJ
+        if not ok:
+            raise MoveRejected("Ziel nicht erreichbar" + ("" if kind == "J" else f": {fmt_pose(target)}"))
+        t0, idle = time.monotonic(), None
+        fwin = []
+        v_prev, t_prev, t_acc = None, None, time.monotonic()
+        while True:
+            self._check(stop)
+            time.sleep(0.004 if guard else 0.01)
+            if base is not None:
+                now = time.monotonic()
+                vt = np.array(r.getTargetTCPSpeed()[:3])
+                if v_prev is None or (now > t_prev and
+                                      float(np.linalg.norm(vt - v_prev)) / (now - t_prev) > 0.05):
+                    t_acc = now                              # Soll beschleunigt/bremst gerade
+                v_prev, t_prev = vt, now
+                f = float(np.linalg.norm(np.array(r.getActualTCPForce()[:3]) - base))
+                if now - t_acc < 0.06:
+                    fwin = []          # Werte aus Beschleunigung/Bremsen verwerfen (Trägheit)
+                    continue_check = False
+                else:
+                    fwin = (fwin + [f])[-4:]                 # gleitender Mittelwert
+                    continue_check = len(fwin) >= 3
+                fm = sum(fwin) / len(fwin) if fwin else 0.0
+                self.peak_force = max(self.peak_force, fm)
+                if continue_check and fm > force_limit:
+                    self._collision(stop, retreat,
+                                    f"Kraftgrenze überschritten ({fm:.1f} N > {force_limit:.0f} N)")
+            if c.getAsyncOperationProgress() >= 0:
+                idle = None
+                continue
+            if self._reached(kind, target):
+                return
+            if time.monotonic() - t0 < 0.3:
+                continue
+            idle = idle or time.monotonic()
+            if time.monotonic() - idle > 1.5:
+                raise MoveRejected("Bewegung vorzeitig beendet (Ziel nicht erreicht)")
 
-    def _collision(self, stop, retreat, use_contact, why):
+    def _collision(self, stop, retreat, why):
         try:
             stop(5.0)
         except Exception:
             pass
-        if use_contact:
-            try:
-                c = self.c
-                c.stopContactDetection()
-            except Exception:
-                pass
         time.sleep(0.3)
         self._move("L", retreat, v=self.cfg["speed"]["v_slow"])
         raise CollisionStop(f"{why} - zurückgefahren und gestoppt. Hindernis prüfen.")
@@ -685,18 +663,22 @@ class RobotTask(QThread):
         self.status.emit("Fahre zur Beobachtungsposition")
         self._move("J", self.cfg["home_q"])
 
-    def _detect(self):
+    def _fresh_frame(self, settle=0.3):
+        """Nächstes gültiges Kamerabild, das mind. `settle` s nach dem Aufruf aufgenommen wurde
+        (schwarze/kaputte Bilder filtert schon _cam_tick heraus)."""
         t0 = time.time()
         while True:
             self._check()
             with self.win.frame_lock:
                 f, ts = self.win.frame, self.win.frame_ts
-            if f is not None and ts > t0 + 0.3:      # Bild nach Stillstand des Roboters
-                f = f.copy()
-                break
+            if f is not None and ts > t0 + settle and frame_ok(f):
+                return f.copy()
             if time.time() - t0 > 5:
-                raise RuntimeError("Keine Kamerabilder")
+                raise RuntimeError("Keine gültigen Kamerabilder (schwarz/abgerissen?)")
             time.sleep(0.02)
+
+    def _detect(self):
+        f = self._fresh_frame()
         dets = [d for d in detect_bricks(f, self.cfg, self.calib) if d["xy"] is not None]
         self.detections.emit(dets)
         return dets
@@ -757,9 +739,18 @@ class RobotTask(QThread):
         picked, fails = 0, []
         while True:
             self._home()
-            dets = self._detect()
-            todo = [d for d in dets if self.cfg["colors"][d["ci"]].get("drop")
-                    and not any(math.dist(d["xy"], f) < 0.015 for f in fails)]
+
+            def usable(dets):
+                return [d for d in dets if self.cfg["colors"][d["ci"]].get("drop")
+                        and not any(math.dist(d["xy"], f) < 0.015 for f in fails)]
+            todo = usable(self._detect())
+            # "leer" erst glauben, wenn auch 2 weitere frische Bilder nichts zeigen
+            # (Kamera liefert gelegentlich gestörte/dunkle Einzelbilder)
+            for _ in range(2):
+                if todo:
+                    break
+                self.status.emit("Keine Steine gefunden - prüfe mit neuem Bild …")
+                todo = usable(self._detect())
             if not todo:
                 msg = f"Sortieren fertig: {picked} Steine abgelegt"
                 return msg + (f", {len(fails)} Stelle(n) übersprungen" if fails else "")
@@ -829,6 +820,7 @@ class LegoSorter(QMainWindow):
         self.task = None
         self._threads = set()
         self._size_warned = False
+        self._bad_frames = 0                       # verworfene schwarze Kamerabilder
 
         self._build_ui()
         self._refresh_points()
@@ -1278,11 +1270,7 @@ class LegoSorter(QMainWindow):
             ("Greifer Kraft:", self._num(("gripper", "force"), 0, 255, 5, 0)),
         ])
         v.addWidget(g)
-        chk = QCheckBox("UR-Kontakterkennung beim Absenken (empfohlen, erkennt Kontakt unabhängig von Beschleunigung)")
-        chk.setChecked(self.cfg.get("contact_detect", True))
-        chk.toggled.connect(lambda on: self._cfg_set(("contact_detect",), on))
-        v.addWidget(chk)
-        v.addWidget(self._hint("Kraftgrenze: wirkt zusätzlich, nur bei konstanter Geschwindigkeit. Die aktuelle "
+        v.addWidget(self._hint("Kraftgrenze beim Absenken: wirkt nur bei konstanter Geschwindigkeit (nicht beim Beschleunigen). Die aktuelle "
                                "Kraft steht oben in der Statuszeile ('F … N'). Testfahrten melden die maximale Kraft."))
         v.addWidget(self._form_box("Geschwindigkeiten", [
             ("moveL v [m/s]:", self._num(("speed", "v"), 0.01, 0.5, 0.01, 2)),
@@ -1420,10 +1408,12 @@ class LegoSorter(QMainWindow):
     def _cam_tick(self):
         if self.cap is not None:
             ok, f = self.cap.read()
-            if ok:
+            if ok and frame_ok(f):           # schwarze/kaputte Bilder gar nicht erst übernehmen
                 with self.frame_lock:
                     self.frame, self.frame_ts = f, time.time()
                 self._check_img_size(f)
+            elif ok:
+                self._bad_frames += 1
         src = self.frozen if self.frozen is not None else self.frame
         if src is None:
             return
