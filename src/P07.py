@@ -38,8 +38,13 @@ from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QColorDialog, QComboBox, QDoubleSpinBox, QFormLayout,
     QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea,
-    QSlider, QSpinBox, QSplitter, QTabWidget, QVBoxLayout, QWidget,
+    QSizePolicy, QSlider, QSpinBox, QSplitter, QTabWidget, QVBoxLayout, QWidget,
 )
+
+try:
+    from dashboard_client import DashboardClient    # Teil von ur_rtde
+except ImportError:
+    DashboardClient = None
 
 from P06 import RTDEControlInterface, RTDEReceiveInterface, RobotiqGripper, Worker, apply_dark, fmt_pose
 
@@ -52,12 +57,15 @@ DEFAULT_CFG = {
     "calib": {"points": [], "H": None, "plane": None, "method": "", "img_size": None},
     "tip_len_mm": 30.0,      # Überstand der Kalibrierspitze über die geschlossenen Finger
     "tip_offset": [0.0, 0.0, 0.0],   # Spitze im TCP-KS [m] (Pivot-Kalibrierung)
-    "pivot": {"poses": [], "rms_mm": None},
+    "pivot": {"poses": [], "rms_mm": None, "manual": False},
+    "force_limit_N": 15.0,   # Kraftgrenze beim Absenken (0 = aus)
+    "contact_detect": True,  # UR-eigene Kontakterkennung (tool_contact) beim Absenken
     "grip_h_mm": 4.0,        # Höhe der Fingerspitzen über dem Tisch beim Greifen
     "approach_mm": 30.0,     # ab hier langsam auf Greifhöhe fahren
     "travel_mm": 120.0,      # Transferhöhe der Fingerspitzen über dem Tisch
     "corr_mm": [0.0, 0.0],   # Feinkorrektur X/Y für Greifpunkte (z. B. Parallaxe)
     # pre_pos 205 = Kalibrierspitze passt gerade so zwischen die Finger (am Roboter getestet)
+    # open_pos = max. Öffnung beim Greifen (Robotiq 0 = ganz offen .. 255 = zu), in der GUI als %
     "gripper": {"pre_pos": 205, "open_pos": 0, "speed": 150, "force": 60, "angle_off_deg": 0.0},
     "speed": {"v": 0.15, "a": 0.8, "v_slow": 0.03, "vj": 0.8, "aj": 1.0},
     "detect": {"min_area": 150, "max_area": 15000, "morph": 1},
@@ -457,7 +465,39 @@ class Abort(Exception):
 
 
 class MoveRejected(RuntimeError):
-    pass
+    """Ziel nicht erreichbar -> Stein wird übersprungen, Sortieren läuft weiter."""
+
+
+class CollisionStop(RuntimeError):
+    """Kraftgrenze überschritten -> zurückgefahren, Sortieren wird beendet."""
+
+
+def finger_pt(cfg, calib):
+    """Mitte der Fingerspitzen im TCP-KS: tip_len hinter der Kalibrierspitze auf Werkzeug-Z."""
+    return calib.tip - np.array([0.0, 0.0, cfg["tip_len_mm"] / 1000])
+
+
+def grasp_poses(cfg, calib, d, ref_yaw):
+    """TCP-Posen (über dem Stein auf Transferhöhe, Annäherung, Greifen) für eine Erkennung d.
+    Die Fingerspitzen (nicht der TCP) werden auf die Höhen gefahren."""
+    x = d["xy"][0] + cfg["corr_mm"][0] / 1000
+    y = d["xy"][1] + cfg["corr_mm"][1] / 1000
+    z0 = calib.table_z(x, y)
+    zg = z0 + max(cfg["grip_h_mm"], 1.0) / 1000
+    za = zg + cfg["approach_mm"] / 1000
+    zt = z0 + cfg["travel_mm"] / 1000
+    t = d["theta"] + math.radians(cfg["gripper"]["angle_off_deg"])
+    t += math.pi * round((ref_yaw - t) / math.pi)      # Greifer ist 180° symmetrisch
+    rv = rotvec_down(t)
+    f = finger_pt(cfg, calib)
+    return (pose_for_point([x, y, zt], rv, f), pose_for_point([x, y, za], rv, f),
+            pose_for_point([x, y, zg], rv, f))
+
+
+def pose_reachable(c, pose, qnear):
+    pose = [float(v) for v in pose]
+    return bool(c.isPoseWithinSafetyLimits(pose)
+                and c.getInverseKinematicsHasSolution(pose, list(qnear), 1e-5, 1e-4))
 
 
 class RobotTask(QThread):
@@ -474,6 +514,8 @@ class RobotTask(QThread):
         self.cfg = json.loads(json.dumps(win.cfg))      # Schnappschuss
         self.calib = Calib.from_cfg(self.cfg)
         self.stop_ev = threading.Event()
+        self.peak_force = 0.0          # max. gefilterte Kraft bei überwachten Bewegungen (zum Einstellen)
+        self._contact_warned = False
 
     def run(self):
         try:
@@ -498,61 +540,142 @@ class RobotTask(QThread):
                     pass
             raise Abort()
         if self.r.isProtectiveStopped() or self.r.isEmergencyStopped():
-            raise RuntimeError("Schutzstopp / Not-Halt aktiv")
+            raise RuntimeError("Schutzstopp / Not-Halt aktiv - nach dem Entriegeln 'Wiederherstellen' drücken")
 
     def _reached(self, kind, target):
         if kind == "J":
             return max(abs(a - b) for a, b in zip(self.r.getActualQ(), target)) < 0.01
         return math.dist(self.r.getActualTCPPose()[:3], target[:3]) < 0.002
 
-    def _move(self, kind, target, v=None, a=None):
-        """kind: 'L' = moveL, 'J' = moveJ (Gelenkwinkel), 'JIK' = moveJ zu kartesischer Pose."""
-        sp, c = self.cfg["speed"], self.c
+    def _require_reachable(self, poses, what):
+        """Vor der Bewegung prüfen, ob die IK eine Lösung hat und die Posen in den Sicherheitsgrenzen liegen
+        (sonst bricht das Skript auf dem UR mit IK-Fehler ab)."""
+        q = list(self.r.getActualQ())
+        for p in poses:
+            if not pose_reachable(self.c, p, q):
+                raise MoveRejected(f"{what} nicht erreichbar (IK / Sicherheitsgrenzen): {fmt_pose(p)}")
+
+    def _move(self, kind, target, v=None, a=None, force_limit=None, retreat=None):
+        """kind: 'L' = moveL, 'J' = moveJ (Gelenkwinkel), 'JIK' = moveJ zu kartesischer Pose.
+        Mit `retreat` ist die Bewegung überwacht (Absenken): Bei Kontakt stoppen, zu `retreat`
+        zurückfahren und mit CollisionStop abbrechen. Überwachung:
+          1. UR-eigene Kontakterkennung (tool_contact) - rechnet Beschleunigung/Dynamik heraus
+          2. optional Kraftgrenze [N] auf die genullte, gefilterte TCP-Kraft, nur bei konstanter
+             Sollgeschwindigkeit (beim Beschleunigen/Bremsen ausgesetzt -> keine Fehlauslösung)"""
+        sp, c, r = self.cfg["speed"], self.c, self.r
         target = [float(x) for x in target]
-        if kind == "L":
-            ok, stop = c.moveL(target, v or sp["v"], a or sp["a"], True), c.stopL
-        elif kind == "J":
-            ok, stop = c.moveJ(target, v or sp["vj"], a or sp["aj"], True), c.stopJ
-        else:
-            ok, stop = c.moveJ_IK(target, v or sp["vj"], a or sp["aj"], True), c.stopJ
-        if not ok:
-            raise MoveRejected("Ziel nicht erreichbar" + ("" if kind == "J" else f": {fmt_pose(target)}"))
-        t0, idle = time.monotonic(), None
-        while True:
-            self._check(stop)
-            time.sleep(0.01)
-            if c.getAsyncOperationProgress() >= 0:
-                idle = None
-                continue
-            if self._reached(kind, target):
-                return
-            if time.monotonic() - t0 < 0.3:
-                continue
-            idle = idle or time.monotonic()
-            if time.monotonic() - idle > 1.5:
-                raise MoveRejected("Bewegung vorzeitig beendet (Ziel nicht erreicht)")
+        if kind != "J":
+            self._require_reachable([target], "Ziel")
+        guard = retreat is not None
+        use_contact = guard and self.cfg.get("contact_detect", True)
+        base = None
+        if guard and force_limit:
+            try:
+                c.zeroFtSensor()
+            except Exception as e:
+                raise RuntimeError(f"Kraftsensor nicht verfügbar ({e}) - Kraftgrenze auf 0 setzen zum Deaktivieren")
+            time.sleep(0.1)
+            samples = []
+            for _ in range(10):
+                samples.append(r.getActualTCPForce()[:3])
+                time.sleep(0.004)
+            base = np.mean(samples, axis=0)          # Rest-Offset nach dem Nullen
+        if use_contact:
+            d = np.array(target[:3]) - np.array(r.getActualTCPPose()[:3])
+            n = float(np.linalg.norm(d))
+            direction = [*(d / n), 0.0, 0.0, 0.0] if n > 1e-4 else [0.0] * 6
+            try:
+                use_contact = bool(c.startContactDetection(direction))
+            except Exception:
+                use_contact = False
+            if not use_contact and not self._contact_warned:
+                self._contact_warned = True
+                self.status.emit("UR-Kontakterkennung nicht verfügbar - nur Kraftgrenze aktiv")
+        try:
+            if kind == "L":
+                ok, stop = c.moveL(target, v or sp["v"], a or sp["a"], True), c.stopL
+            elif kind == "J":
+                ok, stop = c.moveJ(target, v or sp["vj"], a or sp["aj"], True), c.stopJ
+            else:
+                ok, stop = c.moveJ_IK(target, v or sp["vj"], a or sp["aj"], True), c.stopJ
+            if not ok:
+                raise MoveRejected("Ziel nicht erreichbar" + ("" if kind == "J" else f": {fmt_pose(target)}"))
+            t0, idle = time.monotonic(), None
+            fwin = []
+            v_prev, t_prev, t_acc = None, None, time.monotonic()
+            while True:
+                self._check(stop)
+                time.sleep(0.004 if guard else 0.01)
+                if use_contact and c.readContactDetection():
+                    self._collision(stop, retreat, use_contact, "Kontakt erkannt (UR-Kontakterkennung)")
+                if base is not None:
+                    now = time.monotonic()
+                    vt = np.array(r.getTargetTCPSpeed()[:3])
+                    if v_prev is None or (now > t_prev and
+                                          float(np.linalg.norm(vt - v_prev)) / (now - t_prev) > 0.05):
+                        t_acc = now                              # Soll beschleunigt/bremst gerade
+                    v_prev, t_prev = vt, now
+                    f = float(np.linalg.norm(np.array(r.getActualTCPForce()[:3]) - base))
+                    if now - t_acc < 0.06:
+                        fwin = []          # Werte aus Beschleunigung/Bremsen verwerfen (Trägheit)
+                        continue_check = False
+                    else:
+                        fwin = (fwin + [f])[-4:]                 # gleitender Mittelwert
+                        continue_check = len(fwin) >= 3
+                    fm = sum(fwin) / len(fwin) if fwin else 0.0
+                    self.peak_force = max(self.peak_force, fm)
+                    if continue_check and fm > force_limit:
+                        self._collision(stop, retreat, use_contact,
+                                        f"Kraftgrenze überschritten ({fm:.1f} N > {force_limit:.0f} N)")
+                if c.getAsyncOperationProgress() >= 0:
+                    idle = None
+                    continue
+                if self._reached(kind, target):
+                    return
+                if time.monotonic() - t0 < 0.3:
+                    continue
+                idle = idle or time.monotonic()
+                if time.monotonic() - idle > 1.5:
+                    raise MoveRejected("Bewegung vorzeitig beendet (Ziel nicht erreicht)")
+        finally:
+            if use_contact:
+                try:
+                    c.stopContactDetection()
+                except Exception:
+                    pass
+
+    def _collision(self, stop, retreat, use_contact, why):
+        try:
+            stop(5.0)
+        except Exception:
+            pass
+        if use_contact:
+            try:
+                c = self.c
+                c.stopContactDetection()
+            except Exception:
+                pass
+        time.sleep(0.3)
+        self._move("L", retreat, v=self.cfg["speed"]["v_slow"])
+        raise CollisionStop(f"{why} - zurückgefahren und gestoppt. Hindernis prüfen.")
 
     def _grip(self, pos, speed=None, force=None):
         g = self.cfg["gripper"]
         _, st = self.gr.move_and_wait_for_pos(int(pos), int(speed or g["speed"]), int(force or g["force"]))
         return st
 
-    def _finger_pt(self):
-        """Mitte der Fingerspitzen im TCP-KS: tip_len hinter der Kalibrierspitze auf Werkzeug-Z."""
-        return self.calib.tip - np.array([0.0, 0.0, self.cfg["tip_len_mm"] / 1000])
+    def _flim(self):
+        return self.cfg["force_limit_N"] or None
 
-    def _theta(self, theta):
-        """Greiferwinkel (180° symmetrisch) möglichst nah an der Ausrichtung der Beobachtungspose."""
-        t = theta + math.radians(self.cfg["gripper"]["angle_off_deg"])
-        ref = yaw_of(self.cfg["home_pose"] or self.r.getActualTCPPose())
-        return t + math.pi * round((ref - t) / math.pi)
+    def _ref_yaw(self):
+        return yaw_of(self.cfg["home_pose"] or self.r.getActualTCPPose())
 
     def _retreat(self):
         """Senkrecht auf Transferhöhe, bevor eine Gelenkbewegung startet (kein Schleifen über den Tisch)."""
         if self.calib is None:
             return
         p = list(self.r.getActualTCPPose())
-        f = tool_point(p, self._finger_pt())
+        f = tool_point(p, finger_pt(self.cfg, self.calib))
         dz = self.calib.table_z(f[0], f[1]) + self.cfg["travel_mm"] / 1000 - f[2]
         if dz > 0.002:
             self._move("L", [p[0], p[1], p[2] + dz, *p[3:]])
@@ -578,19 +701,6 @@ class RobotTask(QThread):
         self.detections.emit(dets)
         return dets
 
-    def _grasp_poses(self, d):
-        x, y = d["xy"]
-        x += self.cfg["corr_mm"][0] / 1000
-        y += self.cfg["corr_mm"][1] / 1000
-        z0 = self.calib.table_z(x, y)
-        zg = z0 + max(self.cfg["grip_h_mm"], 1.0) / 1000
-        za = zg + self.cfg["approach_mm"] / 1000
-        zt = z0 + self.cfg["travel_mm"] / 1000
-        rv = rotvec_down(self._theta(d["theta"]))
-        f = self._finger_pt()      # Fingerspitzen (nicht der TCP) werden auf diese Punkte gefahren
-        return (pose_for_point([x, y, zt], rv, f), pose_for_point([x, y, za], rv, f),
-                pose_for_point([x, y, zg], rv, f))
-
     def _nearest(self, dets):
         hx, hy = (self.cfg["home_pose"] or self.r.getActualTCPPose())[:2]
         return min(dets, key=lambda d: math.dist(d["xy"], (hx, hy)))
@@ -609,17 +719,23 @@ class RobotTask(QThread):
         """Kalibrierspitze h_mm über den Tisch an (x, y) fahren (Kalibrierungstest)."""
         z = self.calib.table_z(x, y) + h_mm / 1000
         rv = rotvec_down(yaw_of(self.r.getActualTCPPose()))
+        above = pose_for_point([x, y, z + 0.04], rv, self.calib.tip)
+        target = pose_for_point([x, y, z], rv, self.calib.tip)
+        self._require_reachable([above, target], "Testpunkt")
         self._retreat()
-        self._move("JIK", pose_for_point([x, y, z + 0.04], rv, self.calib.tip))
-        self._move("L", pose_for_point([x, y, z], rv, self.calib.tip), v=self.cfg["speed"]["v_slow"])
-        return f"Spitze {h_mm:.0f} mm über X {x*1000:.1f} Y {y*1000:.1f} mm"
+        self._move("JIK", above)
+        self._move("L", target, v=self.cfg["speed"]["v_slow"], force_limit=self._flim(), retreat=above)
+        return (f"Spitze {h_mm:.0f} mm über X {x*1000:.1f} Y {y*1000:.1f} mm "
+                f"(max. Kraft beim Absenken {self.peak_force:.1f} N)")
 
     def job_drop_test(self, ci):
         col = self.cfg["colors"][ci]
         dp = col["drop"]
+        above = [dp[0], dp[1], dp[2] + 0.03, *dp[3:]]
+        self._require_reachable([above, dp], f"Ablage {col['name']}")
         self._retreat()
-        self._move("JIK", [dp[0], dp[1], dp[2] + 0.03, *dp[3:]])
-        self._move("L", dp)
+        self._move("JIK", above)
+        self._move("L", dp, force_limit=self._flim(), retreat=above)
         return f"Ablage {col['name']} erreicht"
 
     def job_hover(self):
@@ -629,11 +745,13 @@ class RobotTask(QThread):
         if not dets:
             return "Keine Steine erkannt"
         d = self._nearest(dets)
-        above, _, grasp = self._grasp_poses(d)
+        above, _, grasp = grasp_poses(self.cfg, self.calib, d, self._ref_yaw())
+        hover = [grasp[0], grasp[1], grasp[2] + 0.015, *grasp[3:]]
+        self._require_reachable([above, hover], f"{d['name']}er Stein")
         self._move("JIK", above)
-        self._move("L", [grasp[0], grasp[1], grasp[2] + 0.015, *grasp[3:]])
+        self._move("L", hover, force_limit=self._flim(), retreat=above)
         return (f"Fingerspitzen 15 mm über Greifhöhe am {d['name']}en Stein - Lage prüfen, "
-                "ggf. Korrektur X/Y bzw. Winkel-Offset anpassen")
+                f"ggf. Korrektur X/Y bzw. Winkel-Offset anpassen (max. Kraft beim Absenken {self.peak_force:.1f} N)")
 
     def job_sort(self):
         picked, fails = 0, []
@@ -644,15 +762,16 @@ class RobotTask(QThread):
                     and not any(math.dist(d["xy"], f) < 0.015 for f in fails)]
             if not todo:
                 msg = f"Sortieren fertig: {picked} Steine abgelegt"
-                return msg + (f", {len(fails)} Stelle(n) nach Fehlgriff übersprungen" if fails else "")
+                return msg + (f", {len(fails)} Stelle(n) übersprungen" if fails else "")
             d = self._nearest(todo)
             self.status.emit(f"Greife {d['name']} bei X {d['xy'][0]*1000:.0f} Y {d['xy'][1]*1000:.0f} mm "
                              f"({len(todo)} erkannt)")
             try:
                 ok = self._pick_place(d)
-            except MoveRejected as e:
+            except MoveRejected as e:          # unerreichbar -> Stein überspringen, weitermachen
                 self.status.emit(f"Übersprungen: {e}")
                 ok = False
+            # CollisionStop wird NICHT abgefangen -> Sortieren endet
             if ok:
                 picked += 1
             else:
@@ -660,12 +779,17 @@ class RobotTask(QThread):
 
     def _pick_place(self, d):
         g, sp = self.cfg["gripper"], self.cfg["speed"]
-        above, approach, grasp = self._grasp_poses(d)
+        above, approach, grasp = grasp_poses(self.cfg, self.calib, d, self._ref_yaw())
+        dp = self.cfg["colors"][d["ci"]]["drop"]
+        drop_above = [dp[0], dp[1], max(above[2], dp[2]), *dp[3:]]
+        # alles vorab prüfen, bevor sich der Roboter bewegt
+        self._require_reachable([above, approach, grasp], f"{d['name']}er Stein")
+        self._require_reachable([drop_above, dp], f"Ablage {d['name']}")
         self._grip(g["open_pos"])
         self._move("JIK", above)
         if approach[2] < above[2]:
-            self._move("L", approach)
-        self._move("L", grasp, v=sp["v_slow"])
+            self._move("L", approach, force_limit=self._flim(), retreat=above)
+        self._move("L", grasp, v=sp["v_slow"], force_limit=self._flim(), retreat=above)
         st = self._grip(255, force=g["force"])
         self._move("L", above)
         if st not in (RobotiqGripper.ObjectStatus.STOPPED_INNER_OBJECT,
@@ -673,15 +797,12 @@ class RobotTask(QThread):
             self.status.emit(f"Kein Stein gegriffen ({d['name']}) - nächster Versuch nach neuer Erkennung")
             self._grip(g["open_pos"])
             return False
-        dp = self.cfg["colors"][d["ci"]]["drop"]
-        zd = max(above[2], dp[2])
-        self._move("JIK", [dp[0], dp[1], zd, *dp[3:]])
-        if dp[2] < zd - 1e-4:
-            self._move("L", dp)
+        self._move("JIK", drop_above)
+        if dp[2] < drop_above[2] - 1e-4:
+            self._move("L", dp, force_limit=self._flim(), retreat=drop_above)
         self._grip(g["open_pos"])
         self.status.emit(f"{d['name']} abgelegt")
         return True
-
 
 # ====================================================================== Hauptfenster
 class LegoSorter(QMainWindow):
@@ -804,7 +925,12 @@ class LegoSorter(QMainWindow):
         self.lbl_tcp = QLabel("")
         tl.addWidget(self.lbl_pose, 1, 0, 1, 6)
         tl.addWidget(self.lbl_grip, 1, 6, 1, 3)
-        tl.addWidget(self.lbl_tcp, 1, 9, 1, 2)
+        tl.addWidget(self.lbl_tcp, 1, 9)
+        self.btn_recover = QPushButton("Wiederherstellen")
+        self.btn_recover.setToolTip("Nach Schutzstopp / Not-Halt / IK-Fehler: entsperren, einschalten, Bremsen "
+                                    "lösen, Steuerskript neu laden, Greifer aktivieren - ohne neu zu verbinden")
+        self.btn_recover.clicked.connect(self.recover_robot)
+        tl.addWidget(self.btn_recover, 1, 10)
         outer.addWidget(top)
 
         # ---- Bild links, Reiter rechts
@@ -859,6 +985,13 @@ class LegoSorter(QMainWindow):
         h.addWidget(self.btn_stop)
         outer.addLayout(h)
 
+        # Labels mit ständig wechselndem Text dürfen das Layout nicht umverteilen
+        # (sonst springt/skaliert das Kamerabild beim Bewegen der Maus)
+        for lbl in (self.lbl_hover, self.lbl_pose, self.lbl_grip, self.lbl_tcp, self.status, self.lbl_count):
+            lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            lbl.setMinimumWidth(0)
+        self.view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
     # ------------------------------------------------------------ Reiter 1
     def _tab_calib(self):
         w = QWidget()
@@ -899,6 +1032,20 @@ class LegoSorter(QMainWindow):
         self.lbl_pivot = QLabel()
         self.lbl_pivot.setWordWrap(True)
         gv.addWidget(self.lbl_pivot)
+        h = QHBoxLayout()
+        self.sp_tip_z = QDoubleSpinBox()
+        self.sp_tip_z.setRange(-500, 500)
+        self.sp_tip_z.setDecimals(1)
+        self.sp_tip_z.setSuffix(" mm")
+        self.sp_tip_z.setValue(self.cfg["tip_offset"][2] * 1000)
+        self.sp_tip_z.setToolTip("Abstand der Spitze vom TCP entlang Werkzeug-Z =\n"
+                                 "Flansch->Fingerspitzen (Datenblatt) + 30 mm Überstand - TCP-Z am Pendant")
+        b = QPushButton("Manuell übernehmen")
+        b.clicked.connect(self.tip_manual)
+        h.addWidget(QLabel("oder Spitze Z manuell:"))
+        h.addWidget(self.sp_tip_z, 1)
+        h.addWidget(b)
+        gv.addLayout(h)
         v.addWidget(g)
 
         g = QGroupBox("Kamera-Kalibrierpunkte")
@@ -1019,6 +1166,52 @@ class LegoSorter(QMainWindow):
         v.addStretch(1)
         return w
 
+    # Robotiq-Position 0 = ganz offen, 255 = zu. Einstellung in % Öffnung (100 % = ganz offen)
+    def _open_spin(self):
+        self.sp_open = QSpinBox()
+        self.sp_open.setRange(0, 100)
+        self.sp_open.setSingleStep(5)
+        self.sp_open.setSuffix(" %")
+        self.sp_open.setToolTip("100 % = ganz offen. Kleiner -> Finger öffnen weniger weit, weniger Kollisionen\n"
+                                "mit Nachbarsteinen. Muss noch sicher über die Steinbreite passen.")
+        self.sp_open.setValue(round((1 - self.cfg["gripper"]["open_pos"] / 255) * 100))
+        self.sp_open.valueChanged.connect(
+            lambda pct: self._cfg_set(("gripper", "open_pos"), int(round((1 - pct / 100) * 255))))
+        self.btn_open_test = QPushButton("Testen")
+        self.btn_open_test.setToolTip("Greifer auf diese Öffnung fahren - nachmessen bzw. Stein dazwischen halten")
+        self.btn_open_test.clicked.connect(self.open_test)
+        w = QWidget()
+        h = QHBoxLayout(w)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.addWidget(self.sp_open, 1)
+        h.addWidget(self.btn_open_test)
+        return w
+
+    def open_test(self):
+        gr = self.gripper
+        if gr is None or self.task is not None:
+            self.status.setText("Greifer nicht verbunden" if gr is None else "Erst laufenden Ablauf beenden")
+            return
+        pct = self.sp_open.value()
+        pos = int(self.cfg["gripper"]["open_pos"])
+        self.btn_open_test.setEnabled(False)
+        self.lbl_grip.setText("Greifer: fährt …")
+
+        def done(res, err):
+            self.btn_open_test.setEnabled(True)
+            if err is not None:
+                self.lbl_grip.setText(f"Greifer-Fehler: {err!r}")
+                return
+            p, obj = res
+            self.lbl_grip.setText(f"Greifer: Position {p}")
+            self._log(f"Öffnungstest: {pct} % = Position {pos}, erreicht {p}"
+                      + (" (auf Objekt gestoppt)" if obj in (RobotiqGripper.ObjectStatus.STOPPED_INNER_OBJECT,
+                                                             RobotiqGripper.ObjectStatus.STOPPED_OUTER_OBJECT)
+                         else "") + " - jetzt Fingerabstand messen")
+
+        g = self.cfg["gripper"]
+        self._run_async(lambda: gr.move_and_wait_for_pos(pos, int(g["speed"]), max(int(g["force"]), 1)), done)
+
     def _form_box(self, title, rows):
         g = QGroupBox(title)
         f = QFormLayout(g)
@@ -1078,12 +1271,19 @@ class LegoSorter(QMainWindow):
             ("Transferhöhe (Fingerspitzen):", self._num(("travel_mm",), 30, 300, 5, 0, " mm")),
             ("Korrektur X:", self._num(("corr_mm", 0), -30, 30, 0.5, 1, " mm")),
             ("Korrektur Y:", self._num(("corr_mm", 1), -30, 30, 0.5, 1, " mm")),
-            ("Greifer-Winkeloffset:", self._num(("gripper", "angle_off_deg"), -180, 180, 90, 0, " °")),
-            ("Greifer offen (Position):", self._num(("gripper", "open_pos"), 0, 255, 5, 0)),
+            ("Kraftgrenze beim Absenken (0 = aus):", self._num(("force_limit_N",), 0, 100, 1, 0, " N")),
+            ("Greifer-Winkeloffset:",self._num(("gripper", "angle_off_deg"), -180, 180, 90, 0, " °")),
+            ("Max. Öffnung beim Greifen/Ablegen:", self._open_spin()),
             ("Greifer Speed:", self._num(("gripper", "speed"), 0, 255, 5, 0)),
             ("Greifer Kraft:", self._num(("gripper", "force"), 0, 255, 5, 0)),
         ])
         v.addWidget(g)
+        chk = QCheckBox("UR-Kontakterkennung beim Absenken (empfohlen, erkennt Kontakt unabhängig von Beschleunigung)")
+        chk.setChecked(self.cfg.get("contact_detect", True))
+        chk.toggled.connect(lambda on: self._cfg_set(("contact_detect",), on))
+        v.addWidget(chk)
+        v.addWidget(self._hint("Kraftgrenze: wirkt zusätzlich, nur bei konstanter Geschwindigkeit. Die aktuelle "
+                               "Kraft steht oben in der Statuszeile ('F … N'). Testfahrten melden die maximale Kraft."))
         v.addWidget(self._form_box("Geschwindigkeiten", [
             ("moveL v [m/s]:", self._num(("speed", "v"), 0.01, 0.5, 0.01, 2)),
             ("moveL a [m/s²]:", self._num(("speed", "a"), 0.05, 2.0, 0.05, 2)),
@@ -1151,6 +1351,7 @@ class LegoSorter(QMainWindow):
         self.btn_disconnect.setEnabled(conn and not busy)
         self.ip_edit.setEnabled(not conn)
         self.btn_free.setEnabled(conn and not busy)
+        self.btn_recover.setEnabled(conn and not busy)
         self.chk_vertical.setEnabled(self.freedrive is None)
         for b in (self.btn_align, self.btn_goto_click, self.btn_drop_goto, self.btn_home_goto, self.btn_hover):
             b.setEnabled(motion)
@@ -1390,8 +1591,148 @@ class LegoSorter(QMainWindow):
             self.lbl_pose.setText(f"Lesefehler: {e}")
             return
         fd = {"teach": "  |  FREEDRIVE", "constrained": "  |  FREEDRIVE senkrecht"}.get(self.freedrive, "")
+        issue = self._robot_issue()
+        try:
+            fx, fy, fz = self.rtde_r.getActualTCPForce()[:3]
+            ftxt = f"  |  F {math.sqrt(fx*fx + fy*fy + fz*fz):.1f} N (Fz {fz:+.1f})"
+        except Exception:
+            ftxt = ""
         self.lbl_pose.setText(f"TCP: X {p[0]*1000:.1f}  Y {p[1]*1000:.1f}  Z {p[2]*1000:.1f} mm  |  "
-                              f"Neigung {math.degrees(tilt_of(p)):.1f}°  Drehung {math.degrees(yaw_of(p)):.1f}°{fd}")
+                              f"Neigung {math.degrees(tilt_of(p)):.1f}°  Drehung {math.degrees(yaw_of(p)):.1f}°{ftxt}{fd}"
+                              + (f"  |  ⚠ {issue}" if issue else ""))
+        self.lbl_pose.setStyleSheet("color:#ff6060; font-weight:bold;" if issue else "")
+        self.btn_recover.setStyleSheet("background:#8a6d00; font-weight:bold;" if issue else "")
+
+    # ------------------------------------------------------------ Zustand / Wiederherstellen
+    def _robot_issue(self):
+        """None = bereit, sonst kurze Beschreibung des Problems."""
+        r, c = self.rtde_r, self.rtde_c
+        if r is None or c is None:
+            return "nicht verbunden"
+        try:
+            if not r.isConnected():
+                return "RTDE-Verbindung unterbrochen"
+            if r.isEmergencyStopped():
+                return "NOT-HALT"
+            if r.isProtectiveStopped():
+                return "SCHUTZSTOPP"
+            if r.getRobotMode() != 7:
+                return "Roboter aus / Bremsen fest"
+            if not c.isConnected() or not c.isProgramRunning():
+                return "Steuerskript gestoppt"
+        except Exception as e:
+            return f"Statusfehler: {e}"
+        return None
+
+    def _ensure_ready(self):
+        """Vor jeder Roboteraktion: gestopptes Steuerskript (z. B. nach IK-Fehler) still neu laden.
+        Schutzstopp / Not-Halt / ausgeschaltet -> Hinweis auf 'Wiederherstellen'."""
+        issue = self._robot_issue()
+        if issue == "Steuerskript gestoppt":
+            try:
+                if not self.rtde_c.isConnected():
+                    self.rtde_c.reconnect()
+                if not self.rtde_c.isProgramRunning():
+                    self.rtde_c.reuploadScript()
+                self._log("Steuerskript neu geladen")
+            except Exception as e:
+                self._log(f"Steuerskript neu laden fehlgeschlagen: {e}")
+            issue = self._robot_issue()
+        if issue:
+            self._log(f"Roboter nicht bereit: {issue} - 'Wiederherstellen' drücken")
+            return False
+        return True
+
+    def recover_robot(self):
+        if self.rtde_c is None or self.task is not None:
+            return
+        issue = self._robot_issue()
+        if issue in ("NOT-HALT", "SCHUTZSTOPP", "Roboter aus / Bremsen fest") and QMessageBox.question(
+                self, "Wiederherstellen",
+                f"Zustand: {issue}\n\nDas Programm entsperrt den Schutzstopp, schaltet den Roboter ein und löst "
+                "die Bremsen (der Roboter ruckt dabei leicht), lädt das Steuerskript neu und aktiviert den Greifer."
+                "\n\nUrsache beseitigt und Arbeitsbereich frei?") != QMessageBox.StandardButton.Yes:
+            return
+        ip = self.ip_edit.text().strip()
+        r, c, gr = self.rtde_r, self.rtde_c, self.gripper
+        self._end_freedrive()
+        self.btn_recover.setEnabled(False)
+        self.status.setText("Stelle Roboter wieder her …")
+
+        def wait_for(cond, timeout, what):
+            t0 = time.time()
+            while not cond():
+                if time.time() - t0 > timeout:
+                    raise RuntimeError(f"Zeitüberschreitung: {what}")
+                time.sleep(0.2)
+
+        def work():
+            log = []
+            if not r.isConnected():
+                r.reconnect()
+                log.append("RTDE-Empfang neu verbunden")
+            if r.isEmergencyStopped():
+                raise RuntimeError("Not-Halt ist noch gedrückt - erst entriegeln, dann erneut 'Wiederherstellen'")
+            dash = None
+            if r.isProtectiveStopped() or r.getRobotMode() != 7:
+                if DashboardClient is None:
+                    raise RuntimeError("dashboard_client fehlt - am Teach Pendant entsperren/einschalten")
+                dash = DashboardClient(ip)
+                dash.connect()
+            if r.isProtectiveStopped():
+                dash.closeSafetyPopup()
+                t0 = time.time()
+                while r.isProtectiveStopped():       # UR erlaubt Entsperren erst 5 s nach dem Stopp
+                    try:
+                        dash.unlockProtectiveStop()
+                    except Exception:
+                        pass
+                    if time.time() - t0 > 12:
+                        raise RuntimeError("Schutzstopp ließ sich nicht entsperren - am Pendant prüfen")
+                    time.sleep(1.0)
+                log.append("Schutzstopp entsperrt")
+            if r.getRobotMode() != 7:
+                dash.closeSafetyPopup()
+                if r.getRobotMode() < 5:             # POWER_OFF / POWER_ON
+                    dash.powerOn()
+                    wait_for(lambda: r.getRobotMode() >= 5, 30, "Einschalten")
+                dash.brakeRelease()
+                wait_for(lambda: r.getRobotMode() == 7, 30, "Bremsen lösen")
+                log.append("Roboter eingeschaltet, Bremsen gelöst")
+            if dash is not None:
+                dash.disconnect()
+            if not c.isConnected():
+                c.reconnect()
+                log.append("RTDE-Steuerung neu verbunden")
+            if not c.isProgramRunning():
+                c.reuploadScript()
+                log.append("Steuerskript neu geladen")
+            new_gr = gr
+            if RobotiqGripper is not None:
+                try:
+                    if gr is None:
+                        raise ConnectionError
+                    if not gr.is_active():
+                        gr.activate(auto_calibrate=False)
+                        log.append("Greifer neu aktiviert")
+                except Exception:
+                    new_gr = RobotiqGripper()
+                    new_gr.connect(ip, GRIPPER_PORT)
+                    new_gr.activate(auto_calibrate=False)
+                    log.append("Greifer neu verbunden + aktiviert")
+            return log, new_gr
+
+        def done(res, err):
+            self.btn_recover.setEnabled(True)
+            if err is not None:
+                self._log(f"Wiederherstellen fehlgeschlagen: {err}")
+                return
+            log, self.gripper = res
+            self.lbl_grip.setText("Greifer: bereit" if self.gripper else "Greifer: getrennt")
+            self._log("Wiederhergestellt" + (": " + ", ".join(log) if log else " (war schon bereit)"))
+            self._update_enabled()
+
+        self._run_async(work, done)
 
     def _set_checked(self, btn, on):
         btn.blockSignals(True)
@@ -1405,6 +1746,8 @@ class LegoSorter(QMainWindow):
             return
         try:
             if on:
+                if not self._ensure_ready():
+                    raise RuntimeError("Roboter nicht bereit")
                 c.speedStop()
                 mode, ok = "teach", False
                 if self.chk_vertical.isChecked():
@@ -1454,6 +1797,9 @@ class LegoSorter(QMainWindow):
             return
         if self.freedrive is not None:
             self._end_freedrive()
+        if not self._ensure_ready():
+            self._update_enabled()
+            return
         t = RobotTask(self, job, **kw)
         t.status.connect(self._log)
         t.detections.connect(self._show_dets)
@@ -1495,7 +1841,7 @@ class LegoSorter(QMainWindow):
             return
         st = self.clamp_state
         pos, speed, force = [(int(self.sl_pre.value()), 80, 1), (255, 40, 150),
-                             (int(self.cfg["gripper"]["open_pos"]), 150, 50)][st]
+                             (0, 150, 50)][st]      # Spitze lösen: ganz auf (unabhängig von max. Öffnung)
         self.btn_clamp.setEnabled(False)
         self.lbl_grip.setText("Greifer: fährt …")
 
@@ -1530,6 +1876,10 @@ class LegoSorter(QMainWindow):
         n = len(self.cfg["pivot"]["poses"])
         t = np.array(self.cfg["tip_offset"]) * 1000
         rms = self.cfg["pivot"].get("rms_mm")
+        if self.cfg["pivot"].get("manual"):
+            self.lbl_pivot.setText(f"Manuell eingetragen: Spitze im TCP-KS X {t[0]:.1f}  Y {t[1]:.1f}  Z {t[2]:.1f} mm "
+                                   "(nicht gemessen - Pivot ist genauer)")
+            return
         if rms is None:
             txt = f"{n} Pose(n) aufgenommen. Kein Spitzen-Offset gemessen -> Kamerapunkte nur senkrecht aufnehmen!"
         else:
@@ -1566,12 +1916,25 @@ class LegoSorter(QMainWindow):
         t, q, res = pivot_calibrate(poses)
         self.cfg["tip_offset"] = [float(x) for x in t]
         self.cfg["pivot"]["rms_mm"] = float(np.sqrt((res ** 2).mean()) * 1000)
+        self.cfg["pivot"]["manual"] = False
+        self.sp_tip_z.setValue(t[2] * 1000)
         self._update_pivot_label()
         self.save()
         msg = f"Spitzen-Offset gemessen (Pivotpunkt X {q[0]*1000:.1f} Y {q[1]*1000:.1f} Z {q[2]*1000:.1f} mm)"
         if self.calib is not None:
             msg += " - Kamera-Kalibrierung jetzt neu berechnen!"
         self._log(msg)
+
+    def tip_manual(self):
+        self.cfg["tip_offset"] = [0.0, 0.0, self.sp_tip_z.value() / 1000]
+        self.cfg["pivot"]["manual"] = True
+        self._update_pivot_label()
+        self.save()
+        self._log("Spitzen-Offset manuell gesetzt" +
+                  (" - Kamera-Kalibrierung jetzt neu berechnen!" if self.calib is not None else ""))
+
+    def _tip_known(self):
+        return self.cfg["pivot"].get("manual") or self.cfg["pivot"].get("rms_mm") is not None
 
     # ------------------------------------------------------------ Kamera-Punkte
     def calib_capture(self):
@@ -1582,7 +1945,7 @@ class LegoSorter(QMainWindow):
             return
         pose = self._pose()
         tilt = math.degrees(tilt_of(pose))
-        if tilt > 2 and self.cfg["pivot"].get("rms_mm") is None and QMessageBox.question(
+        if tilt > 2 and not self._tip_known() and QMessageBox.question(
                 self, "Werkzeug geneigt",
                 f"Das Werkzeug ist {tilt:.1f}° geneigt, aber der Spitzen-Offset ist noch nicht gemessen.\n"
                 "Erst Pivot-Kalibrierung machen - sonst wird die Spitzenposition falsch.\n"
@@ -1894,6 +2257,8 @@ class LegoSorter(QMainWindow):
             if d["xy"] is not None:
                 t += f"  →  X {d['xy'][0]*1000:.1f}  Y {d['xy'][1]*1000:.1f} mm, " \
                      f"Greifwinkel {math.degrees(d['theta']) % 180:.0f}°"
+                if d.get("reach") is False:
+                    t += "   ⚠ NICHT ERREICHBAR"
             self.list_dets.addItem(t)
         if not dets:
             self.list_dets.addItem("Keine Steine erkannt")
@@ -1902,7 +2267,18 @@ class LegoSorter(QMainWindow):
         if self.frame is None:
             self.status.setText("Kein Kamerabild")
             return
-        self._show_dets(detect_bricks(self.frame, self.cfg, self.calib))
+        dets = detect_bricks(self.frame, self.cfg, self.calib)
+        # Erreichbarkeit per IK vorab prüfen (nur wenn verbunden und kein Ablauf aktiv)
+        if self.calib is not None and self.task is None and self._robot_issue() is None:
+            try:
+                q = list(self.rtde_r.getActualQ())
+                ref = yaw_of(self.cfg["home_pose"] or self._pose())
+                for d in dets:
+                    d["reach"] = all(pose_reachable(self.rtde_c, p, q)
+                                     for p in grasp_poses(self.cfg, self.calib, d, ref))
+            except Exception as e:
+                self._log(f"IK-Prüfung fehlgeschlagen: {e}")
+        self._show_dets(dets)
         self.cb_view.setCurrentIndex(2)
         if self.calib is None:
             self.status.setText("Hinweis: ohne Kalibrierung keine Roboter-Koordinaten")
