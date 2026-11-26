@@ -1,0 +1,8 @@
+train: images
+val: images
+
+names:
+  0: duplo_4_red
+  1: duplo_4_yellow
+  2: duplo_4_blue
+  3: ignore

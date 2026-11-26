@@ -1,0 +1,4 @@
+duplo_4_red
+duplo_4_yellow
+duplo_4_blue
+ignore

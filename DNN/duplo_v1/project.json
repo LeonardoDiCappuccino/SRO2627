@@ -1,0 +1,11 @@
+{
+  "classes": [
+    "duplo_4_red",
+    "duplo_4_yellow",
+    "duplo_4_blue",
+    "ignore"
+  ],
+  "camera_index": 2,
+  "width": 640,
+  "height": 480
+}
