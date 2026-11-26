@@ -1,28 +1,3 @@
-"""P07 - Lego-Sortierer: Kamera erkennt Legosteine, UR3e + Robotiq sortiert sie in Kisten
-
-Start:  python src/P07.py
-Benötigt: PyQt6, ur_rtde, opencv-python, numpy (+ P06.py und robotiq_gripper.py im selben Ordner)
-
-Ablauf (Reiter rechts):
-  1. Kalibrierung: rote Kalibrierspitze einspannen (Knopf 2x drücken). Roboter im Freedrive
-     ("senkrecht" = nur X/Y/Z + Drehung um Z frei) mit der Spitze an >= 3 (besser 5-6) weit
-     verteilte Stellen auf den Tisch stellen. Jeweils "Pose übernehmen" -> Standbild ->
-     Spitze im Bild anklicken (Mausrad = Zoom, rechte Maustaste = verschieben).
-  2. Farben: HSV-Bereich je Steinfarbe einstellen (Regler, Pipette im Bild, Farbwähler).
-  3. Ablagen: im Freedrive je Farbe die Pose über der Kiste speichern, dazu eine
-     Beobachtungsposition, in der der Roboter nicht im Kamerabild ist.
-  4. Sortieren: erkennt alle Steine, greift sie nacheinander und legt sie in die Kisten.
-
-Greifer-Offset: wird per Pivot-Kalibrierung gemessen. Die Spitze bleibt auf EINEM Punkt
-stehen, der Roboter wird mehrmals verschieden geneigt. Aus R_i * t + p_i = q (für alle Posen)
-folgt per Least Squares der Spitzen-Offset t im TCP-KS. Damit ist die Spitzenposition für jede
-Pose bekannt -> die Kamera-Kalibrierpunkte dürfen schräg aufgenommen werden (Kamera sieht die
-Spitze). Die Fingerspitzen liegen tip_len (30 mm) hinter der Spitze auf der Werkzeug-Z-Achse.
-Ohne Pivot (t = 0) funktioniert es weiterhin, dann aber nur mit senkrechten Kalibrierposen.
-Der TCP am Teach Pendant ist egal, er muss nur von Pivot bis Sortieren gleich bleiben.
-
-ACHTUNG: Die Software bewegt einen echten Roboter. Not-Halt in Reichweite halten!
-"""
 import json
 import math
 import os
